@@ -51,6 +51,7 @@ jobs:
     - name: Install build requirements
       run: python -m pip install -r requirements.txt wheel ninja
     - name: Build wheel from exact source
+      id: build-wheel
       run: python -m pip wheel --no-deps --wheel-dir wheelhouse .
     - name: Verify native Python, wheel PE payloads and RECORD
       shell: python
@@ -63,10 +64,12 @@ jobs:
         \        count=0\n        for n,h,size in csv.reader(io.StringIO(z.read(records[0]).decode())):\n            if h:\n\
         \                alg,want=h.split('=',1)\n                b=z.read(n)\n                assert base64.urlsafe_b64encode(hashlib.new(alg,b).digest()).rstrip(b'=').decode()==want,n\n\
         \                assert len(b)==int(size),n\n                count+=1\n        natives={n:hex(machine(z.read(n)))\
-        \ for n in z.namelist() if n.lower().endswith(('.pyd','.dll'))}\n        assert natives and all(x=='0xaa64' for x\
-        \ in natives.values()),natives\n        result.append({'wheel':path.name,'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'record_verified':count,'native':natives})\n\
-        pathlib.Path('wheel-audit.json').write_text(json.dumps(result,indent=2))\nprint(json.dumps(result,indent=2))\n"
+        \ for n in z.namelist() if n.lower().endswith(('.pyd','.dll'))}\n        result.append({'wheel':path.name,'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'record_verified':count,'native':natives})\n\
+        pathlib.Path('wheel-audit.json').write_text(json.dumps(result,indent=2))\nprint(json.dumps(result,indent=2))\nassert\
+        \ all(r['native'] and all(v=='0xaa64' for v in r['native'].values()) for r in result), 'Wheel contains non-ARM64 payload;\
+        \ see wheel-audit.json'\n"
     - name: Fresh environment full upstream tests
+      if: ${{ !cancelled() && steps.build-wheel.outcome == 'success' }}
       shell: pwsh
       run: '$ErrorActionPreference = ''Stop''
 
