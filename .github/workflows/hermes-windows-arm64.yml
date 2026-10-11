@@ -49,25 +49,35 @@ jobs:
       with:
         arch: arm64
     - name: Install build requirements
-      run: python -m pip install -r requirements.txt wheel ninja
+      run: python -m pip install -r requirements.txt wheel ninja pefile
     - name: Build wheel from exact source
       id: build-wheel
       run: python -m pip wheel --no-deps --wheel-dir wheelhouse .
-    - name: Verify native Python, wheel PE payloads and RECORD
+    - name: Verify native import closure and inventory hybrid CRT companion
       shell: python
-      run: "import base64,csv,hashlib,io,json,pathlib,struct,sys,sysconfig,zipfile\nassert sysconfig.get_platform() == 'win-arm64',\
-        \ sysconfig.get_platform()\ndef machine(b):\n    assert b[:2] == b'MZ'\n    p=struct.unpack_from('<I', b, 0x3c)[0]\n\
-        \    assert b[p:p+4] == b'PE\\0\\0'\n    return struct.unpack_from('<H',b,p+4)[0]\nassert machine(pathlib.Path(sys.executable).read_bytes())\
-        \ == 0xaa64\nroots=['wheelhouse']\nwheels=sorted({p for r in roots for p in pathlib.Path(r).glob('*.whl')})\nassert\
-        \ wheels, roots\nresult=[]\nfor path in wheels:\n    assert 'win_arm64' in path.name, path.name\n    with zipfile.ZipFile(path)\
-        \ as z:\n        records=[n for n in z.namelist() if n.endswith('.dist-info/RECORD')]\n        assert len(records)==1\n\
-        \        count=0\n        for n,h,size in csv.reader(io.StringIO(z.read(records[0]).decode())):\n            if h:\n\
-        \                alg,want=h.split('=',1)\n                b=z.read(n)\n                assert base64.urlsafe_b64encode(hashlib.new(alg,b).digest()).rstrip(b'=').decode()==want,n\n\
-        \                assert len(b)==int(size),n\n                count+=1\n        natives={n:hex(machine(z.read(n)))\
-        \ for n in z.namelist() if n.lower().endswith(('.pyd','.dll'))}\n        result.append({'wheel':path.name,'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'record_verified':count,'native':natives})\n\
-        pathlib.Path('wheel-audit.json').write_text(json.dumps(result,indent=2))\nprint(json.dumps(result,indent=2))\nassert\
-        \ all(r['native'] and all(v=='0xaa64' for v in r['native'].values()) for r in result), 'Wheel contains non-ARM64 payload;\
-        \ see wheel-audit.json'\n"
+      run: "\"\"\"Validate wheel integrity and native import closure, inventory hybrid CRTs.\"\"\"\nimport base64,csv,hashlib,io,json,pathlib,struct,subprocess,sys,sysconfig,zipfile\n\
+        import pefile\n\ndef validate_inventory(items):\n    by_name={pathlib.PurePosixPath(n).name.lower():r for n,r in items.items()}\n\
+        \    imported={n.lower() for r in items.values() for n in r['imports']+r['delay_imports']}\n    roots=[r for n,r in\
+        \ items.items() if n.endswith('.pyd') or pathlib.PurePosixPath(n).name=='blosc.dll']\n    assert roots and all(r['machine']=='0xaa64'\
+        \ for r in roots)\n    companions=[]\n    for name,r in by_name.items():\n        if r['machine']=='0xaa64':continue\n\
+        \        # Do not misclassify the unused hybrid CRT companion as a native root.\n        assert name=='vcruntime140_1.dll',\
+        \ (name,r)\n        assert r['machine']=='0x8664' and r['chpe_metadata_pointer'] and r['chpe_pointer_in_image'],r\n\
+        \        assert name not in imported, ('non-native companion entered import closure',name)\n        companions.append(name)\n\
+        \    return companions\n\ndef inspect(path):\n    with zipfile.ZipFile(path) as z:\n        record=[n for n in z.namelist()\
+        \ if n.endswith('.dist-info/RECORD')];assert len(record)==1\n        count=0\n        for n,h,size in csv.reader(io.StringIO(z.read(record[0]).decode())):\n\
+        \            if h:\n                alg,want=h.split('=',1);b=z.read(n)\n                assert base64.urlsafe_b64encode(hashlib.new(alg,b).digest()).rstrip(b'=').decode()==want,n\n\
+        \                assert len(b)==int(size),n\n                count+=1\n        inventory={}\n        for n in z.namelist():\n\
+        \            if not n.lower().endswith(('.pyd','.dll')):continue\n            p=pefile.PE(data=z.read(n));load=getattr(p,'DIRECTORY_ENTRY_LOAD_CONFIG',None)\n\
+        \            chpe=getattr(load.struct,'CHPEMetadataPointer',0) if load else 0\n            inventory[n]={'machine':hex(p.FILE_HEADER.Machine),'imports':[x.dll.decode()\
+        \ for x in getattr(p,'DIRECTORY_ENTRY_IMPORT',[])],'delay_imports':[x.dll.decode() for x in getattr(p,'DIRECTORY_ENTRY_DELAY_IMPORT',[])],'chpe_metadata_pointer':chpe,'chpe_pointer_in_image':p.OPTIONAL_HEADER.ImageBase<=chpe<p.OPTIONAL_HEADER.ImageBase+p.OPTIONAL_HEADER.SizeOfImage}\n\
+        \        companions=validate_inventory(inventory)\n        return {'wheel':path.name,'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'record_verified':count,'inventory':inventory,'non_imported_hybrid_crt_companions':companions,'native_runtime_roots_verified':True,'all_payload_machine_arm64':all(x['machine']=='0xaa64'\
+        \ for x in inventory.values())}\n\ndef main():\n    assert sysconfig.get_platform()=='win-arm64',sysconfig.get_platform()\n\
+        \    assert pefile.PE(sys.executable).FILE_HEADER.Machine==0xaa64\n    paths=list(pathlib.Path('wheelhouse').glob('*.whl'));assert\
+        \ len(paths)==1\n    records=[inspect(p) for p in paths]\n    pathlib.Path('wheel-audit.json').write_text(json.dumps(records,indent=2))\n\
+        \    print(json.dumps(records,indent=2))\n    out=pathlib.Path('pe-evidence');out.mkdir(exist_ok=True)\n    with zipfile.ZipFile(paths[0])\
+        \ as z:\n        for n in z.namelist():\n            if not n.endswith(('.pyd','.dll')):continue\n            f=out/pathlib.PurePosixPath(n).name;f.write_bytes(z.read(n))\n\
+        \            p=subprocess.run(['dumpbin','/headers','/loadconfig','/imports',str(f)],capture_output=True,text=True,check=True)\n\
+        \            f.with_suffix(f.suffix+'.txt').write_text(p.stdout)\n            f.unlink()\n\nif __name__=='__main__':main()\n"
     - name: Fresh environment full upstream tests
       if: ${{ !cancelled() && steps.build-wheel.outcome == 'success' }}
       shell: pwsh
@@ -83,7 +93,7 @@ jobs:
 
         if ($wheels.Count -ne 1) { throw ''Expected one wheel'' }
 
-        & $py -m pip install numpy $wheels[0].FullName
+        & $py -m pip install numpy psutil $wheels[0].FullName
 
         if ($LASTEXITCODE -ne 0) { throw ''wheel install failed'' }
 
@@ -106,7 +116,9 @@ jobs:
 
           provenance.json
 
-          wheel-audit.json'
+          wheel-audit.json
+
+          pe-evidence/*.txt'
         if-no-files-found: warn
         retention-days: 14
       if: ${{ always() }}
